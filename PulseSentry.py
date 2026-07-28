@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 PulseSentry - Service, SSL & Blockchain RPC Monitor with Telegram Alerts
+            - Static HTML Status Page Generation
 """
 
 import argparse
@@ -10,7 +11,7 @@ import sqlite3
 import sys
 import time
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import requests
 import urllib3
@@ -36,7 +37,8 @@ SSL_WARNING_DAYS = 15
 CONNECT_TIMEOUT = 10
 ALERT_COOLDOWN_HOURS = 6
 RPC_LAG_THRESHOLD = 100  # blocks behind tip before marking RPC down
-VERSION = "1.2.0"
+VERSION = "2.0.0"
+HTML_OUTPUT = "pulsesentry_status.html"
 # =======================================
 
 console = Console()
@@ -72,6 +74,8 @@ def init_db():
     """Initialize SQLite database for tracking uptime history."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
+
+    # Per-check results
     cur.execute("""
         CREATE TABLE IF NOT EXISTS checks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -84,6 +88,8 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_service_time
         ON checks(service, timestamp)
     """)
+
+    # Alert cooldowns
     cur.execute("""
         CREATE TABLE IF NOT EXISTS alerts (
             service TEXT NOT NULL,
@@ -92,6 +98,31 @@ def init_db():
             PRIMARY KEY (service, alert_type)
         )
     """)
+
+    # Downtime tracking: each row is one outage episode
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS downtime_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            service TEXT NOT NULL,
+            down_at REAL NOT NULL,
+            up_at REAL,
+            duration_seconds REAL
+        )
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_downtime_service
+        ON downtime_log(service, down_at)
+    """)
+
+    # Current state of each service (tracks open downtime windows)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS service_state (
+            service TEXT PRIMARY KEY,
+            is_down INTEGER NOT NULL DEFAULT 0,
+            down_since REAL
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -105,6 +136,74 @@ def record_check(service, is_up):
     )
     cutoff = time.time() - (31 * 86400)
     cur.execute("DELETE FROM checks WHERE timestamp < ?", (cutoff,))
+    conn.commit()
+    conn.close()
+
+def track_service_state(service, is_up):
+    """
+    Track service state transitions for downtime logging.
+    - If service just went DOWN: record down_since in service_state.
+    - If service just came UP: close the open downtime_log entry.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT is_down, down_since FROM service_state WHERE service = ?",
+        (service,)
+    )
+    row = cur.fetchone()
+
+    if row is None:
+        # First time seeing this service
+        if is_up:
+            cur.execute(
+                "INSERT INTO service_state (service, is_down, down_since) "
+                "VALUES (?, 0, NULL)",
+                (service,)
+            )
+        else:
+            now = time.time()
+            cur.execute(
+                "INSERT INTO service_state (service, is_down, down_since) "
+                "VALUES (?, 1, ?)",
+                (service, now)
+            )
+            cur.execute(
+                "INSERT INTO downtime_log (service, down_at) VALUES (?, ?)",
+                (service, now)
+            )
+    else:
+        was_down, down_since = row[0], row[1]
+        if was_down and is_up:
+            # Transition: DOWN → UP
+            now = time.time()
+            duration = now - down_since if down_since else 0
+            cur.execute(
+                "UPDATE service_state SET is_down = 0, down_since = NULL "
+                "WHERE service = ?",
+                (service,)
+            )
+            # Close the most recent open downtime_log row
+            cur.execute("""
+                UPDATE downtime_log
+                SET up_at = ?, duration_seconds = ?
+                WHERE service = ? AND up_at IS NULL
+                ORDER BY down_at DESC LIMIT 1
+            """, (now, duration, service))
+        elif not was_down and not is_up:
+            # Transition: UP → DOWN
+            now = time.time()
+            cur.execute(
+                "UPDATE service_state SET is_down = 1, down_since = ? "
+                "WHERE service = ?",
+                (now, service)
+            )
+            cur.execute(
+                "INSERT INTO downtime_log (service, down_at) VALUES (?, ?)",
+                (service, now)
+            )
+
     conn.commit()
     conn.close()
 
@@ -123,6 +222,59 @@ def get_uptime_percentage(service, hours):
     if not total or total == 0:
         return None
     return (up / total) * 100
+
+def get_daily_status(service, days=30):
+    """
+    Return a list of (date_str, status) for the last `days` calendar days.
+    Status is one of: "green", "yellow", "red".
+    - green: total downtime < 5 minutes that day
+    - yellow: 5 min ≤ total downtime < 2 hours that day
+    - red: total downtime ≥ 2 hours that day
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    now = time.time()
+    day_seconds = 86400
+    result = []
+
+    for offset in range(days - 1, -1, -1):
+        day_start = now - (offset + 1) * day_seconds
+        day_end = now - offset * day_seconds
+
+        # Start of the next day for the date label
+        day_dt = datetime.fromtimestamp(day_end, tz=timezone.utc)
+        date_str = day_dt.strftime("%Y-%m-%d")
+
+        # Sum downtime that overlaps this calendar day
+        # downtime_log entries: down_at ≤ up_at (or up_at is NULL)
+        cur.execute("""
+            SELECT down_at, COALESCE(up_at, ?) AS effective_up
+            FROM downtime_log
+            WHERE service = ?
+              AND down_at < ?
+              AND COALESCE(up_at, ?) > ?
+        """, (day_end, service, day_end, day_end, day_start))
+
+        rows = cur.fetchall()
+        total_downtime = 0.0
+        for down_at, effective_up in rows:
+            overlap_start = max(down_at, day_start)
+            overlap_end = min(effective_up, day_end)
+            if overlap_end > overlap_start:
+                total_downtime += overlap_end - overlap_start
+
+        if total_downtime < 300:  # less than 5 minutes
+            status = "green"
+        elif total_downtime < 7200:  # less than 2 hours
+            status = "yellow"
+        else:
+            status = "red"
+
+        result.append((date_str, status))
+
+    conn.close()
+    return result
 
 def should_send_alert(service, alert_type):
     """Check if an alert should be sent (respects cooldown)."""
@@ -332,6 +484,9 @@ def evaluate_rpc_lag(results):
         # Now that is_up is finalized, record it
         record_check(r["service"], r["is_up"])
 
+        # Track state transitions for downtime logging
+        track_service_state(r["service"], r["is_up"])
+
         # Recalculate uptime percentages with the final value recorded
         r["uptime_24h"] = get_uptime_percentage(r["service"], 24)
         r["uptime_7d"] = get_uptime_percentage(r["service"], 24 * 7)
@@ -424,22 +579,22 @@ def colorize_status(result):
 def colorize_ssl(result):
     """Return colored SSL status."""
     if not result["tcp_up"]:
-        return Text("—", style="dim")
+        return Text("\u2014", style="dim")
     if not result["has_ssl"]:
         return Text("No SSL", style="dim white")
     days = result["days_left"]
     if days is None:
         return Text("Unknown", style="yellow")
     if days <= 0:
-        return Text("✗ EXPIRED", style="bold red")
+        return Text("\u2717 EXPIRED", style="bold red")
     if days <= SSL_WARNING_DAYS:
-        return Text(f"⚠ {days}d left", style="bold yellow")
-    return Text(f"✓ OK ({days}d)", style="bold green")
+        return Text(f"\u26a0 {days}d left", style="bold yellow")
+    return Text(f"\u2713 OK ({days}d)", style="bold green")
 
 def format_expiry(result):
     """Format SSL expiry date."""
     if not result["tcp_up"] or not result["has_ssl"]:
-        return Text("—", style="dim")
+        return Text("\u2014", style="dim")
     if result["expiry_dt"] is None:
         return Text("Unknown", style="dim")
     return Text(
@@ -452,7 +607,7 @@ def format_height(result):
     if not result["is_rpc"]:
         return Text("N/A", style="dim")
     if not result["tcp_up"]:
-        return Text("—", style="dim")
+        return Text("\u2014", style="dim")
     height = result["block_height"]
     if height is None:
         return Text("ERROR", style="bold red")
@@ -533,12 +688,12 @@ def build_summary(results, interval, chain_tip):
     rpc_lag = sum(1 for r in results if r["rpc_lagging"])
 
     parts = [
-        f"[bold green]● UP:[/bold green] {up}",
-        f"[bold red]● DOWN:[/bold red] {down}",
-        f"[bold yellow]⚠ SSL Warn:[/bold yellow] {ssl_warn}",
-        f"[bold red]✗ SSL Exp:[/bold red] {ssl_exp}",
-        f"[bold cyan]⛓ RPC OK:[/bold cyan] {rpc_ok}/{rpc_total}",
-        f"[bold red]⛓ Lagging:[/bold red] {rpc_lag}",
+        f"[bold green]\u25cf UP:[/bold green] {up}",
+        f"[bold red]\u25cf DOWN:[/bold red] {down}",
+        f"[bold yellow]\u26a0 SSL Warn:[/bold yellow] {ssl_warn}",
+        f"[bold red]\u2717 SSL Exp:[/bold red] {ssl_exp}",
+        f"[bold cyan]\u26d3 RPC OK:[/bold cyan] {rpc_ok}/{rpc_total}",
+        f"[bold red]\u26d3 Lagging:[/bold red] {rpc_lag}",
     ]
     if chain_tip is not None:
         parts.append(f"[bold magenta]Tip:[/bold magenta] {chain_tip:,}")
@@ -548,11 +703,317 @@ def build_summary(results, interval, chain_tip):
     )
 
     return Panel(
-        "  •  ".join(parts),
+        "  \u2022  ".join(parts),
         border_style="bright_yellow",
         box=box.ROUNDED,
         padding=(0, 1)
     )
+
+def publish_status_page(results, output_path=HTML_OUTPUT):
+    """
+    Generate a static HTML status page with a golden-yellow / black theme.
+    Each service gets:
+      - Current online/offline badge
+      - 30-day uptime percentage
+      - Horizontal 30-day meter bar (green/yellow/red per day)
+    """
+    now_utc = datetime.now(timezone.utc)
+    generated_str = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    # CSS (golden-yellow / black theme)
+    css = """
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+        background: #0a0a0a;
+        color: #e0d090;
+        font-family: 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
+        min-height: 100vh;
+    }
+    .header {
+        background: linear-gradient(180deg, #1a1400 0%, #111006 100%);
+        border-bottom: 3px solid #c8a020;
+        padding: 24px 32px;
+        text-align: center;
+    }
+    .header h1 {
+        color: #f0c040;
+        font-size: 2rem;
+        letter-spacing: 2px;
+        text-transform: uppercase;
+        text-shadow: 0 0 18px rgba(240,192,64,0.5);
+    }
+    .header .subtitle {
+        color: #a08030;
+        font-size: 0.85rem;
+        margin-top: 4px;
+    }
+    .container {
+        max-width: 960px;
+        margin: 0 auto;
+        padding: 28px 20px 40px 20px;
+    }
+    .service-card {
+        background: #14110a;
+        border: 1px solid #3a3010;
+        border-radius: 10px;
+        padding: 22px 26px;
+        margin-bottom: 20px;
+        box-shadow: 0 2px 12px rgba(200,160,32,0.08);
+        transition: border-color 0.3s;
+    }
+    .service-card:hover {
+        border-color: #c8a020;
+    }
+    .service-name {
+        font-size: 1.15rem;
+        font-weight: 700;
+        color: #f0d060;
+        font-family: 'Consolas', 'Fira Code', monospace;
+        margin-bottom: 8px;
+    }
+    .service-meta {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+        flex-wrap: wrap;
+        margin-bottom: 14px;
+    }
+    .badge {
+        display: inline-block;
+        padding: 4px 14px;
+        border-radius: 20px;
+        font-size: 0.82rem;
+        font-weight: 700;
+        letter-spacing: 0.5px;
+        text-transform: uppercase;
+    }
+    .badge-online {
+        background: rgba(34,197,94,0.15);
+        color: #22c55e;
+        border: 1px solid #22c55e;
+        box-shadow: 0 0 10px rgba(34,197,94,0.25);
+    }
+    .badge-offline {
+        background: rgba(239,68,68,0.15);
+        color: #ef4444;
+        border: 1px solid #ef4444;
+        box-shadow: 0 0 10px rgba(239,68,68,0.25);
+    }
+    .uptime-pct {
+        font-size: 1.6rem;
+        font-weight: 800;
+        color: #f0c040;
+    }
+    .uptime-label {
+        font-size: 0.75rem;
+        color: #8a7030;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+    }
+    .meter-section {
+        margin-top: 8px;
+    }
+    .meter-label {
+        font-size: 0.72rem;
+        color: #8a7030;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+        margin-bottom: 6px;
+    }
+    .meter-bar {
+        display: flex;
+        gap: 3px;
+        height: 24px;
+        border-radius: 5px;
+        overflow: hidden;
+        background: #1c1808;
+        padding: 3px;
+    }
+    .meter-segment {
+        flex: 1;
+        min-width: 6px;
+        border-radius: 3px;
+        position: relative;
+        transition: transform 0.15s;
+    }
+    .meter-segment:hover {
+        transform: scaleY(1.35);
+        z-index: 2;
+    }
+    .meter-segment.green { background: #22c55e; box-shadow: 0 0 6px rgba(34,197,94,0.5); }
+    .meter-segment.yellow { background: #eab308; box-shadow: 0 0 6px rgba(234,179,8,0.5); }
+    .meter-segment.red { background: #ef4444; box-shadow: 0 0 6px rgba(239,68,68,0.5); }
+    .meter-segment.no-data { background: #2a2818; box-shadow: none; }
+    .meter-legend {
+        display: flex;
+        gap: 18px;
+        margin-top: 8px;
+        font-size: 0.7rem;
+        color: #7a6820;
+    }
+    .legend-dot {
+        display: inline-block;
+        width: 10px;
+        height: 10px;
+        border-radius: 2px;
+        margin-right: 4px;
+        vertical-align: middle;
+    }
+    .legend-dot.green { background: #22c55e; }
+    .legend-dot.yellow { background: #eab308; }
+    .legend-dot.red { background: #ef4444; }
+    .footer {
+        text-align: center;
+        padding: 20px;
+        color: #5a4a18;
+        font-size: 0.72rem;
+        border-top: 1px solid #2a2410;
+        margin-top: 30px;
+    }
+    .rpc-info {
+        font-size: 0.8rem;
+        color: #a08030;
+        margin-top: 6px;
+    }
+    .ssl-info {
+        font-size: 0.78rem;
+        margin-top: 4px;
+    }
+    .ssl-ok { color: #22c55e; }
+    .ssl-warn { color: #eab308; }
+    .ssl-expired { color: #ef4444; }
+    """
+
+    # Build service cards HTML
+    cards_html = ""
+    for r in results:
+        svc = r["service"]
+        is_online = r["is_up"]
+        uptime_30d = r.get("uptime_30d")
+
+        # Online/Offline badge
+        if is_online:
+            badge_html = '<span class="badge badge-online">\u25cf Online</span>'
+        else:
+            badge_html = '<span class="badge badge-offline">\u25cf Offline</span>'
+
+        # Uptime percentage
+        if uptime_30d is not None:
+            pct_html = f'<span class="uptime-pct">{uptime_30d:.1f}%</span>'
+        else:
+            pct_html = '<span class="uptime-pct">--</span>'
+
+        # 30-day meter
+        daily = get_daily_status(svc, days=30)
+        if daily:
+            segments = ""
+            for date_str, status in daily:
+                title = f"{date_str}: {status}"
+                segments += (
+                    f'<span class="meter-segment {status}" '
+                    f'title="{title}"></span>'
+                )
+        else:
+            segments = (
+                '<span class="meter-segment no-data" '
+                'title="No data yet"></span>' * 30
+            )
+
+        # SSL info
+        ssl_html = ""
+        if r.get("has_ssl") and r.get("days_left") is not None:
+            days_left = r["days_left"]
+            expiry = ""
+            if r.get("expiry_dt"):
+                expiry = r["expiry_dt"].strftime("%Y-%m-%d %H:%M UTC")
+            if days_left <= 0:
+                ssl_html = (
+                    f'<div class="ssl-info ssl-expired">'
+                    f'\u2717 SSL EXPIRED \u2014 Expires: {expiry}</div>'
+                )
+            elif days_left <= SSL_WARNING_DAYS:
+                ssl_html = (
+                    f'<div class="ssl-info ssl-warn">'
+                    f'\u26a0 SSL expires in {days_left} days '
+                    f'({expiry})</div>'
+                )
+            else:
+                ssl_html = (
+                    f'<div class="ssl-info ssl-ok">'
+                    f'\u2713 SSL OK \u2014 {days_left} days remaining</div>'
+                )
+
+        # RPC info
+        rpc_html = ""
+        if r.get("is_rpc") and r.get("block_height") is not None:
+            height = f"{r['block_height']:,}"
+            if r.get("blocks_behind") is not None and r["blocks_behind"] > 0:
+                height += f" (-{r['blocks_behind']:,} behind)"
+            rpc_html = f'<div class="rpc-info">\u26d3 Block height: {height}</div>'
+
+        cards_html += f"""
+        <div class="service-card">
+            <div class="service-name">{svc}</div>
+            <div class="service-meta">
+                {badge_html}
+                <div>
+                    <div class="uptime-label">30-Day Uptime</div>
+                    {pct_html}
+                </div>
+            </div>
+            {rpc_html}
+            {ssl_html}
+            <div class="meter-section">
+                <div class="meter-label">30-Day History</div>
+                <div class="meter-bar">{segments}</div>
+                <div class="meter-legend">
+                    <span><span class="legend-dot green"></span> Up (&lt;5m downtime)</span>
+                    <span><span class="legend-dot yellow"></span> Brief outage</span>
+                    <span><span class="legend-dot red"></span> Extended outage</span>
+                </div>
+            </div>
+        </div>"""
+
+    # Full HTML page
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="refresh" content="120">
+<title>PulseSentry - Status</title>
+<style>{css}</style>
+</head>
+<body>
+
+<div class="header">
+    <h1>\u26a1 PulseSentry</h1>
+    <div class="subtitle">Service Status Dashboard &bull; Generated {generated_str}</div>
+</div>
+
+<div class="container">
+{cards_html}
+</div>
+
+<div class="footer">
+    PulseSentry v{VERSION} &bull; Auto-refreshes every 2 minutes &bull; by freQniK
+</div>
+
+</body>
+</html>"""
+
+    # Write to CWD
+    out_path = Path(output_path)
+    try:
+        out_path.write_text(html, encoding="utf-8")
+        console.print(
+            f"[green][INFO][/green] Status page published to "
+            f"[bold]{out_path.resolve()}[/bold]"
+        )
+    except OSError as e:
+        console.print(
+            f"[red][ERROR][/red] Failed to write status page: {e}"
+        )
 
 def render(results, interval, chain_tip):
     """Clear screen and render full dashboard."""
@@ -580,6 +1041,16 @@ def main():
         action="store_true",
         help="Run a single check and exit"
     )
+    parser.add_argument(
+        "--publish-html",
+        action="store_true",
+        help="Publish a static HTML status page after each check cycle"
+    )
+    parser.add_argument(
+        "--html-output",
+        default=HTML_OUTPUT,
+        help=f"Path for the HTML status page (default: {HTML_OUTPUT})"
+    )
     args = parser.parse_args()
 
     if not Path(args.input_file).exists():
@@ -594,6 +1065,8 @@ def main():
         console.print("[red][ERROR][/red] No valid services found")
         sys.exit(1)
 
+    # If --publish-html used with --once, just generate and exit
+    # after the check cycle (consistent behavior)
     try:
         while True:
             # Phase 1: gather all check data
@@ -602,7 +1075,7 @@ def main():
                 results.append(check_service(host, port))
 
             # Phase 2: evaluate RPC lag now that all heights are known,
-            # then record to DB and compute uptime percentages
+            # then record to DB, track state, and compute uptime percentages
             chain_tip = evaluate_rpc_lag(results)
 
             # Phase 3: send notifications based on final state
@@ -610,6 +1083,10 @@ def main():
                 handle_notifications(result, chain_tip)
 
             render(results, args.interval, chain_tip)
+
+            # Phase 4: publish HTML status page if requested
+            if args.publish_html:
+                publish_status_page(results, args.html_output)
 
             if args.once:
                 break

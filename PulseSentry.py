@@ -2,6 +2,7 @@
 """
 PulseSentry - Service, SSL & Blockchain RPC Monitor with Telegram Alerts
             - Static HTML Status Page Generation
+            - Moniker support for human-readable service names
 """
 
 import argparse
@@ -37,7 +38,7 @@ SSL_WARNING_DAYS = 15
 CONNECT_TIMEOUT = 10
 ALERT_COOLDOWN_HOURS = 6
 RPC_LAG_THRESHOLD = 100  # blocks behind tip before marking RPC down
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 HTML_OUTPUT = "pulsesentry_status.html"
 # =======================================
 
@@ -120,6 +121,14 @@ def init_db():
             service TEXT PRIMARY KEY,
             is_down INTEGER NOT NULL DEFAULT 0,
             down_since REAL
+        )
+    """)
+
+    # Moniker registry: maps service ID to human-readable name
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS service_monikers (
+            service TEXT PRIMARY KEY,
+            moniker TEXT NOT NULL
         )
     """)
 
@@ -242,12 +251,9 @@ def get_daily_status(service, days=30):
         day_start = now - (offset + 1) * day_seconds
         day_end = now - offset * day_seconds
 
-        # Start of the next day for the date label
         day_dt = datetime.fromtimestamp(day_end, tz=timezone.utc)
         date_str = day_dt.strftime("%Y-%m-%d")
 
-        # Sum downtime that overlaps this calendar day
-        # downtime_log entries: down_at ≤ up_at (or up_at is NULL)
         cur.execute("""
             SELECT down_at, COALESCE(up_at, ?) AS effective_up
             FROM downtime_log
@@ -264,9 +270,9 @@ def get_daily_status(service, days=30):
             if overlap_end > overlap_start:
                 total_downtime += overlap_end - overlap_start
 
-        if total_downtime < 300:  # less than 5 minutes
+        if total_downtime < 300:
             status = "green"
-        elif total_downtime < 7200:  # less than 2 hours
+        elif total_downtime < 7200:
             status = "yellow"
         else:
             status = "red"
@@ -275,6 +281,29 @@ def get_daily_status(service, days=30):
 
     conn.close()
     return result
+
+def get_service_moniker(service):
+    """Look up the moniker for a service from the database."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT moniker FROM service_monikers WHERE service = ?", (service,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+def get_display_name(service):
+    """
+    Return the best display name for a service.
+    If a moniker is registered that differs from the hostname, show "Moniker (host:port)".
+    Otherwise just show "host:port".
+    """
+    moniker = get_service_moniker(service)
+    if moniker:
+        # Extract hostname from service ID for comparison
+        hostname = service.rsplit(":", 1)[0]
+        if moniker != hostname:
+            return f"{moniker} ({service})"
+    return service
 
 def should_send_alert(service, alert_type):
     """Check if an alert should be sent (respects cooldown)."""
@@ -400,7 +429,11 @@ def check_rpc_status(host, port):
         return (False, None)
 
 def parse_services_file(filepath):
-    """Parse the services input file."""
+    """
+    Parse the services input file.
+    Format: host:port or host:port,moniker
+    Returns list of (host, port, service_id, moniker) tuples.
+    """
     services = []
     with open(filepath, 'r') as f:
         for line in f:
@@ -412,26 +445,60 @@ def parse_services_file(filepath):
                     f"[yellow][WARN][/yellow] Skipping invalid line: {line}"
                 )
                 continue
-            host, port = line.rsplit(':', 1)
+
+            # Split on comma for optional moniker
+            moniker = None
+            if ',' in line:
+                addr_part, moniker = line.split(',', 1)
+                moniker = moniker.strip()
+                if not moniker:
+                    moniker = None
+            else:
+                addr_part = line
+
+            host, port = addr_part.rsplit(':', 1)
+            host = host.strip()
             try:
-                services.append((host.strip(), int(port.strip())))
+                port_int = int(port.strip())
             except ValueError:
                 console.print(
                     f"[yellow][WARN][/yellow] Invalid port: {line}"
                 )
+                continue
+
+            service_id = f"{host}:{port_int}"
+            # If no moniker given, use the hostname as default
+            if moniker is None:
+                moniker = host
+
+            services.append((host, port_int, service_id, moniker))
+
     return services
 
-def check_service(host, port):
+def register_monikers(services):
+    """Register monikers in the database."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    for _, _, service_id, moniker in services:
+        cur.execute("""
+            INSERT OR REPLACE INTO service_monikers (service, moniker)
+            VALUES (?, ?)
+        """, (service_id, moniker))
+    conn.commit()
+    conn.close()
+
+def check_service(host, port, service_id):
     """
     Perform initial check on a service. Note: RPC lag evaluation and
     final is_up determination happen later in evaluate_rpc_lag() once
     all RPC heights are known.
     """
-    service_id = f"{host}:{port}"
     tcp_up = check_tcp_connection(host, port)
 
     result = {
         "service": service_id,
+        "host": host,
+        "port": port,
         "tcp_up": tcp_up,
         "is_up": tcp_up,  # may be overridden by RPC lag check
         "has_ssl": False,
@@ -497,13 +564,14 @@ def evaluate_rpc_lag(results):
 def handle_notifications(result, chain_tip):
     """Send Telegram notifications for issues."""
     service = result["service"]
+    display_name = get_display_name(service)
 
     # RPC lagging notification (specific alert type)
     if result["rpc_lagging"]:
         if should_send_alert(service, "rpc_lag"):
             msg = (
-                f"⛓️ *PulseSentry Alert - RPC LAGGING*\n\n"
-                f"*Service:* `{service}`\n"
+                f"\u26d3\ufe0f *PulseSentry Alert - RPC LAGGING*\n\n"
+                f"*Service:* `{display_name}`\n"
                 f"*Time:* {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                 f"*Node Height:* {result['block_height']:,}\n"
                 f"*Network Tip:* {chain_tip:,}\n"
@@ -525,7 +593,6 @@ def handle_notifications(result, chain_tip):
                 f"{result['uptime_7d']:.2f}%"
                 if result['uptime_7d'] is not None else "N/A"
             )
-            # Distinguish between TCP down and RPC /status failure
             if result["is_rpc"] and result["tcp_up"]:
                 reason = (
                     "TCP connection succeeded but /status endpoint failed."
@@ -533,8 +600,8 @@ def handle_notifications(result, chain_tip):
             else:
                 reason = "TCP connection failed."
             msg = (
-                f"🔴 *PulseSentry Alert - Service DOWN*\n\n"
-                f"*Service:* `{service}`\n"
+                f"\U0001f534 *PulseSentry Alert - Service DOWN*\n\n"
+                f"*Service:* `{display_name}`\n"
                 f"*Time:* {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                 f"*Reason:* {reason}\n"
                 f"*24h Uptime:* {uptime_24h}\n"
@@ -553,16 +620,16 @@ def handle_notifications(result, chain_tip):
         if days <= 0:
             if should_send_alert(service, "ssl_expired"):
                 msg = (
-                    f"⛔ *PulseSentry Alert - SSL EXPIRED*\n\n"
-                    f"*Service:* `{service}`\n"
+                    f"\u26d4 *PulseSentry Alert - SSL EXPIRED*\n\n"
+                    f"*Service:* `{display_name}`\n"
                     f"*Expired:* {expiry_str}"
                 )
                 send_telegram(msg)
         elif days <= SSL_WARNING_DAYS:
             if should_send_alert(service, "ssl_warning"):
                 msg = (
-                    f"⚠️ *PulseSentry Alert - SSL Expiring Soon*\n\n"
-                    f"*Service:* `{service}`\n"
+                    f"\u26a0\ufe0f *PulseSentry Alert - SSL Expiring Soon*\n\n"
+                    f"*Service:* `{display_name}`\n"
                     f"*Days remaining:* {days}\n"
                     f"*Expires:* {expiry_str}"
                 )
@@ -571,10 +638,10 @@ def handle_notifications(result, chain_tip):
 def colorize_status(result):
     """Return colored status text."""
     if result["rpc_lagging"]:
-        return Text("● LAGGING", style="bold red")
+        return Text("\u25cf LAGGING", style="bold red")
     if result["is_up"]:
-        return Text("● UP", style="bold green")
-    return Text("● DOWN", style="bold red")
+        return Text("\u25cf UP", style="bold green")
+    return Text("\u25cf DOWN", style="bold red")
 
 def colorize_ssl(result):
     """Return colored SSL status."""
@@ -633,7 +700,7 @@ def colorize_uptime(pct):
     return Text(f"{pct:.2f}%", style=style)
 
 def build_table(results):
-    """Build a Rich table of results."""
+    """Build a Rich table of results — shows moniker names."""
     table = Table(
         title=None,
         box=box.ROUNDED,
@@ -653,7 +720,7 @@ def build_table(results):
 
     for r in results:
         table.add_row(
-            r["service"],
+            get_display_name(r["service"]),
             colorize_status(r),
             format_height(r),
             colorize_ssl(r),
@@ -713,7 +780,7 @@ def publish_status_page(results, output_path=HTML_OUTPUT):
     """
     Generate a static HTML status page with a golden-yellow / black theme.
     Each service gets:
-      - Current online/offline badge
+      - Current online/offline badge (uses moniker name)
       - 30-day uptime percentage
       - Horizontal 30-day meter bar (green/yellow/red per day)
     """
@@ -770,6 +837,12 @@ def publish_status_page(results, output_path=HTML_OUTPUT):
         color: #f0d060;
         font-family: 'Consolas', 'Fira Code', monospace;
         margin-bottom: 8px;
+    }
+    .service-hostport {
+        font-size: 0.78rem;
+        color: #8a7030;
+        font-weight: 400;
+        margin-left: 6px;
     }
     .service-meta {
         display: flex;
@@ -891,6 +964,17 @@ def publish_status_page(results, output_path=HTML_OUTPUT):
         is_online = r["is_up"]
         uptime_30d = r.get("uptime_30d")
 
+        # Display name for HTML
+        moniker = get_service_moniker(svc)
+        if moniker:
+            hostname = svc.rsplit(":", 1)[0]
+            if moniker != hostname:
+                svc_html = f'{moniker}'
+            else:
+                svc_html = svc
+        else:
+            svc_html = svc
+
         # Online/Offline badge
         if is_online:
             badge_html = '<span class="badge badge-online">\u25cf Online</span>'
@@ -953,7 +1037,7 @@ def publish_status_page(results, output_path=HTML_OUTPUT):
 
         cards_html += f"""
         <div class="service-card">
-            <div class="service-name">{svc}</div>
+            <div class="service-name">{svc_html}</div>
             <div class="service-meta">
                 {badge_html}
                 <div>
@@ -1028,7 +1112,8 @@ def main():
     )
     parser.add_argument(
         "input_file",
-        help="File containing host:PORT entries (one per line)"
+        help="File containing host:port entries (one per line), "
+             "optionally with comma-separated moniker: host:port,MyName"
     )
     parser.add_argument(
         "--interval",
@@ -1065,14 +1150,15 @@ def main():
         console.print("[red][ERROR][/red] No valid services found")
         sys.exit(1)
 
-    # If --publish-html used with --once, just generate and exit
-    # after the check cycle (consistent behavior)
+    # Register monikers so they persist across restarts
+    register_monikers(services)
+
     try:
         while True:
             # Phase 1: gather all check data
             results = []
-            for host, port in services:
-                results.append(check_service(host, port))
+            for host, port, service_id, moniker in services:
+                results.append(check_service(host, port, service_id))
 
             # Phase 2: evaluate RPC lag now that all heights are known,
             # then record to DB, track state, and compute uptime percentages
